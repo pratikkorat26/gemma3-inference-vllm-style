@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Optional, Set, Tuple
 
 import torch
 
@@ -17,8 +17,9 @@ class RequestState:
     max_new_tokens: int
     eos_token_id: Optional[int]
     generated_ids: List[int] = field(default_factory=list)
+    all_token_ids: List[int] = field(default_factory=list)
+    seen_token_ids: Set[int] = field(default_factory=set)
     past_kv: LayerCache = None
-    all_token_ids: Optional[torch.Tensor] = None
     current_input: Optional[torch.Tensor] = None
     text_chunks: List[str] = field(default_factory=list)
     status: str = "queued"
@@ -73,3 +74,11 @@ class GenerationResult:
     model_tokens_per_s: float = 0.0
     prefill_steps: int = 0
     decode_steps: int = 0
+
+
+@dataclass(frozen=True)
+class StreamEvent:
+    kind: str
+    text: str = ""
+    stop_reason: Optional[str] = None
+    error_message: Optional[str] = None

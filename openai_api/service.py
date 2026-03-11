@@ -108,28 +108,37 @@ class ChatCompletionService:
         }
         yield f"data: {json.dumps(first)}\n\n"
 
-        for chunk in self.engine.generate_stream(
+        final_stop_reason = "eos"
+        for event in self.engine.generate_stream_events(
             prompt=prompt,
             sampling=sampling,
             max_new_tokens=request.max_tokens,
         ):
-            if not chunk:
+            if event.kind == "text":
+                if not event.text:
+                    continue
+                payload = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": self.model_name,
+                    "choices": [{"index": 0, "delta": {"content": event.text}, "finish_reason": None}],
+                }
+                yield f"data: {json.dumps(payload)}\n\n"
                 continue
-            payload = {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": self.model_name,
-                "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}],
-            }
-            yield f"data: {json.dumps(payload)}\n\n"
+
+            final_stop_reason = event.stop_reason or "eos"
+            if event.error_message is not None:
+                error_payload = {"error": {"message": event.error_message, "type": "server_error"}}
+                yield f"data: {json.dumps(error_payload)}\n\n"
+                break
 
         final = {
             "id": completion_id,
             "object": "chat.completion.chunk",
             "created": created,
             "model": self.model_name,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "choices": [{"index": 0, "delta": {}, "finish_reason": _finish_reason(final_stop_reason)}],
         }
         yield f"data: {json.dumps(final)}\n\n"
         yield "data: [DONE]\n\n"

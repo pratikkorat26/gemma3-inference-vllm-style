@@ -7,7 +7,7 @@ import torch
 from .config import EngineConfig, SamplingConfig
 from .runtime import GemmaRuntime, apply_chat_template
 from .sampling import apply_repetition_penalty_, sample_next_token
-from .types import GenerationResult, RequestState
+from .types import GenerationResult, RequestState, StreamEvent
 
 
 class LLMEngine:
@@ -62,6 +62,8 @@ class LLMEngine:
         request.status = "active"
         request.phase = "prefill"
         request.generated_ids = []
+        request.all_token_ids = list(request.prompt_token_ids)
+        request.seen_token_ids = set(request.prompt_token_ids)
         request.text_chunks = []
         request.past_kv = None
         request.stop_reason = None
@@ -72,7 +74,6 @@ class LLMEngine:
 
         prompt_ids = torch.tensor(request.prompt_token_ids, device=self.runtime.device).unsqueeze(0)
         request.current_input = prompt_ids
-        request.all_token_ids = prompt_ids
 
     def _make_result(self, request: RequestState) -> GenerationResult:
         first_scheduled = request.first_scheduled_at_s if request.first_scheduled_at_s is not None else request.created_at_s
@@ -81,10 +82,18 @@ class LLMEngine:
         total_latency_s = max(0.0, finished - request.created_at_s)
         model_time_s = request.prefill_time_s + request.decode_time_s
         model_tokens_per_s = 0.0 if model_time_s <= 0 else len(request.generated_ids) / model_time_s
+        text_ids = list(request.generated_ids)
+        if (
+            request.stop_reason == "eos"
+            and request.eos_token_id is not None
+            and text_ids
+            and text_ids[-1] == request.eos_token_id
+        ):
+            text_ids = text_ids[:-1]
 
         return GenerationResult(
             request_id=request.request_id,
-            text="".join(request.text_chunks),
+            text=self.runtime.tokenizer.decode(text_ids) if text_ids else "",
             token_ids=list(request.generated_ids),
             stop_reason=request.stop_reason or "error",
             error_message=request.error_message,
@@ -99,8 +108,7 @@ class LLMEngine:
 
     def _decode_step(self, request: RequestState) -> torch.Tensor:
         assert request.current_input is not None
-        assert request.all_token_ids is not None
-        with torch.no_grad():
+        with torch.inference_mode():
             logits, request.past_kv = self.runtime.model(
                 request.current_input,
                 past_kv=request.past_kv,
@@ -109,7 +117,7 @@ class LLMEngine:
             next_logits = logits[:, -1, :]
             next_logits = apply_repetition_penalty_(
                 next_logits,
-                request.all_token_ids,
+                [request.seen_token_ids],
                 penalty=request.sampling.repetition_penalty,
             )
             return sample_next_token(
@@ -119,10 +127,28 @@ class LLMEngine:
                 top_k=request.sampling.top_k,
             )
 
-    def _run_one_step(self, request: RequestState, phase: str) -> None:
-        assert request.all_token_ids is not None
+    def _record_next_token(self, request: RequestState, next_token: torch.Tensor, *, emit_text: bool) -> None:
+        next_id = int(next_token.item())
+        request.generated_ids.append(next_id)
 
-        if int(request.all_token_ids.shape[1]) >= self._context_limit():
+        if request.eos_token_id is not None and next_id == request.eos_token_id:
+            self._finish_request(request, reason="eos")
+            return
+
+        request.all_token_ids.append(next_id)
+        request.seen_token_ids.add(next_id)
+        request.current_input = next_token
+        if emit_text:
+            request.text_chunks.append(self.runtime.tokenizer.decode([next_id]))
+
+        if len(request.generated_ids) >= request.max_new_tokens:
+            self._finish_request(request, reason="max_new_tokens")
+            return
+
+        request.phase = "decode"
+
+    def _run_one_step(self, request: RequestState, phase: str, *, emit_text: bool = False) -> None:
+        if len(request.all_token_ids) >= self._context_limit():
             self._finish_request(request, reason="context_limit")
             return
 
@@ -132,26 +158,12 @@ class LLMEngine:
 
         if phase == "prefill":
             request.prefill_time_s += elapsed
+            request.decode_steps += 1
         else:
             request.decode_time_s += elapsed
             request.decode_steps += 1
 
-        next_id = int(next_token.item())
-        request.generated_ids.append(next_id)
-
-        if request.eos_token_id is not None and next_id == request.eos_token_id:
-            self._finish_request(request, reason="eos")
-            return
-
-        request.text_chunks.append(self.runtime.tokenizer.decode([next_id]))
-        request.current_input = next_token
-        request.all_token_ids = torch.cat([request.all_token_ids, next_token], dim=1)
-
-        if len(request.generated_ids) >= request.max_new_tokens:
-            self._finish_request(request, reason="max_new_tokens")
-            return
-
-        request.phase = "decode"
+        self._record_next_token(request, next_token, emit_text=emit_text)
 
     def _sampling_key(self, request: RequestState):
         return (
@@ -166,12 +178,12 @@ class LLMEngine:
         batch = [first]
         max_batch = max(1, int(self.config.max_decode_batch_size))
 
-        target_len = int(first.all_token_ids.shape[1]) if first.all_token_ids is not None else -1
+        target_len = len(first.all_token_ids)
         target_sampling = self._sampling_key(first)
         remaining = len(decode_queue)
         for _ in range(remaining):
             candidate = decode_queue.popleft()
-            candidate_len = int(candidate.all_token_ids.shape[1]) if candidate.all_token_ids is not None else -1
+            candidate_len = len(candidate.all_token_ids)
             candidate_sampling = self._sampling_key(candidate)
             if len(batch) < max_batch and candidate_len == target_len and candidate_sampling == target_sampling:
                 batch.append(candidate)
@@ -182,10 +194,10 @@ class LLMEngine:
     def _run_decode_batch(self, batch: List[RequestState]) -> None:
         eligible: List[RequestState] = []
         for request in batch:
-            if request.all_token_ids is None or request.current_input is None:
+            if request.current_input is None:
                 self._finish_request(request, reason="error", error_message="request tensors are not initialized")
                 continue
-            if int(request.all_token_ids.shape[1]) >= self._context_limit():
+            if len(request.all_token_ids) >= self._context_limit():
                 self._finish_request(request, reason="context_limit")
                 continue
             eligible.append(request)
@@ -194,7 +206,6 @@ class LLMEngine:
             return
 
         current_input = torch.cat([request.current_input for request in eligible], dim=0)
-        all_ids = torch.cat([request.all_token_ids for request in eligible], dim=0)
 
         layer_count = len(eligible[0].past_kv) if eligible[0].past_kv is not None else 0
         if layer_count == 0:
@@ -210,12 +221,12 @@ class LLMEngine:
             merged_past.append((merged_k, merged_v))
 
         started = time.perf_counter()
-        with torch.no_grad():
+        with torch.inference_mode():
             logits, merged_next = self.runtime.model(current_input, past_kv=merged_past, use_cache=True)
             next_logits = logits[:, -1, :]
             next_logits = apply_repetition_penalty_(
                 next_logits,
-                all_ids,
+                [request.seen_token_ids for request in eligible],
                 penalty=eligible[0].sampling.repetition_penalty,
             )
             next_tokens = sample_next_token(
@@ -239,22 +250,7 @@ class LLMEngine:
             request.decode_steps += 1
 
             next_token = next_tokens[batch_idx : batch_idx + 1]
-            next_id = int(next_token.item())
-            request.generated_ids.append(next_id)
-
-            if request.eos_token_id is not None and next_id == request.eos_token_id:
-                self._finish_request(request, reason="eos")
-                continue
-
-            request.text_chunks.append(self.runtime.tokenizer.decode([next_id]))
-            request.current_input = next_token
-            request.all_token_ids = torch.cat([request.all_token_ids, next_token], dim=1)
-
-            if len(request.generated_ids) >= request.max_new_tokens:
-                self._finish_request(request, reason="max_new_tokens")
-                continue
-
-            request.phase = "decode"
+            self._record_next_token(request, next_token, emit_text=False)
 
     def generate_many(
         self,
@@ -331,13 +327,13 @@ class LLMEngine:
 
         return [results[request_id] for request_id in ordered_ids]
 
-    def generate_stream(
+    def generate_stream_events(
         self,
         prompt: str,
         *,
         sampling: Optional[SamplingConfig] = None,
         max_new_tokens: Optional[int] = None,
-    ) -> Iterator[str]:
+    ) -> Iterator[StreamEvent]:
         request = self._build_request(
             request_id=0,
             prompt=prompt,
@@ -348,18 +344,49 @@ class LLMEngine:
         request.first_scheduled_at_s = time.perf_counter()
         self._init_request(request)
 
-        if request.max_new_tokens <= 0 or len(request.prompt_token_ids) >= self._context_limit():
+        if request.max_new_tokens <= 0:
+            self._finish_request(request, reason="max_new_tokens")
+            yield StreamEvent(kind="done", stop_reason=request.stop_reason)
             return
 
-        self._run_one_step(request, phase="prefill")
-        if request.text_chunks:
-            yield request.text_chunks[-1]
+        if len(request.prompt_token_ids) >= self._context_limit():
+            self._finish_request(request, reason="context_limit")
+            yield StreamEvent(kind="done", stop_reason=request.stop_reason)
+            return
 
-        while request.status not in ("finished", "error"):
-            previous_chunks = len(request.text_chunks)
-            self._run_one_step(request, phase="decode")
-            if len(request.text_chunks) > previous_chunks:
-                yield request.text_chunks[-1]
+        try:
+            self._run_one_step(request, phase="prefill", emit_text=True)
+            if request.text_chunks:
+                yield StreamEvent(kind="text", text=request.text_chunks[-1])
+
+            while request.status not in ("finished", "error"):
+                previous_chunks = len(request.text_chunks)
+                self._run_one_step(request, phase="decode", emit_text=True)
+                if len(request.text_chunks) > previous_chunks:
+                    yield StreamEvent(kind="text", text=request.text_chunks[-1])
+        except Exception as exc:
+            self._finish_request(request, reason="error", error_message=str(exc))
+
+        yield StreamEvent(
+            kind="done",
+            stop_reason=request.stop_reason,
+            error_message=request.error_message,
+        )
+
+    def generate_stream(
+        self,
+        prompt: str,
+        *,
+        sampling: Optional[SamplingConfig] = None,
+        max_new_tokens: Optional[int] = None,
+    ) -> Iterator[str]:
+        for event in self.generate_stream_events(
+            prompt=prompt,
+            sampling=sampling,
+            max_new_tokens=max_new_tokens,
+        ):
+            if event.kind == "text" and event.text:
+                yield event.text
 
     def generate(
         self,

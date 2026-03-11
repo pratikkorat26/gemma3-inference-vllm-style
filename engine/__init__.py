@@ -1,7 +1,7 @@
 from .config import EngineConfig, SamplingConfig
 from .runtime import GemmaRuntime, get_device
 from .scheduler import LLMEngine
-from .types import GenerationResult
+from .types import GenerationResult, StreamEvent
 
 __all__ = [
     "EngineConfig",
@@ -9,5 +9,6 @@ __all__ = [
     "GemmaRuntime",
     "LLMEngine",
     "GenerationResult",
+    "StreamEvent",
     "get_device",
 ]

@@ -82,21 +82,37 @@ def resolve_tokenizer_path(repo_id: str, local_dir: str) -> str:
     if tokenizer_path.exists():
         return str(tokenizer_path)
 
+    fallback = Path("tokenizer.json")
+    if fallback.exists():
+        return str(fallback)
+
     try:
         return hf_hub_download(repo_id=repo_id, filename="tokenizer.json", local_dir=local_dir)
     except Exception as e:
-        print(f"Warning: failed to download tokenizer.json: {e}")
-        return "tokenizer.json"
+        raise FileNotFoundError(
+            "tokenizer.json is unavailable locally and could not be downloaded."
+        ) from e
 
 
-def apply_repetition_penalty_(logits: torch.Tensor, all_token_ids: torch.Tensor, penalty: Optional[float]) -> torch.Tensor:
+def apply_repetition_penalty_(logits: torch.Tensor, all_token_ids, penalty: Optional[float]) -> torch.Tensor:
     if penalty is None or penalty <= 1.0:
         return logits
 
-    for b in range(logits.size(0)):
-        used = torch.unique(all_token_ids[b])
-        used_logits = logits[b, used]
-        logits[b, used] = torch.where(used_logits < 0, used_logits * penalty, used_logits / penalty)
+    if isinstance(all_token_ids, torch.Tensor):
+        token_rows = [torch.unique(all_token_ids[b]).tolist() for b in range(logits.size(0))]
+    else:
+        token_rows = [list(token_ids) for token_ids in all_token_ids]
+
+    for batch_idx, used_ids in enumerate(token_rows):
+        if not used_ids:
+            continue
+        used_ids_tensor = torch.tensor(used_ids, device=logits.device, dtype=torch.long)
+        used_logits = logits[batch_idx, used_ids_tensor]
+        logits[batch_idx, used_ids_tensor] = torch.where(
+            used_logits < 0,
+            used_logits * penalty,
+            used_logits / penalty,
+        )
     return logits
 
 
@@ -139,22 +155,25 @@ def generate_text_stream(
     repetition_penalty: float,
 ) -> Iterator[torch.Tensor]:
     model.eval()
-    generated = token_ids
+    generated_ids = token_ids.squeeze(0).tolist()
+    seen_token_ids = set(generated_ids)
     past_kv = None
     cur_input = token_ids
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for _ in range(max_new_tokens):
             out, past_kv = model(cur_input, past_kv=past_kv, use_cache=True)
             logits = out[:, -1, :]
-            logits = apply_repetition_penalty_(logits, generated, repetition_penalty)
+            logits = apply_repetition_penalty_(logits, [seen_token_ids], repetition_penalty)
             next_token = sample_next_token(logits, temperature=temperature, top_p=top_p, top_k=top_k)
 
             if eos_token_id is not None and torch.all(next_token == eos_token_id):
                 break
 
             yield next_token
-            generated = torch.cat([generated, next_token], dim=1)
+            next_id = int(next_token.item())
+            generated_ids.append(next_id)
+            seen_token_ids.add(next_id)
             cur_input = next_token
 
 

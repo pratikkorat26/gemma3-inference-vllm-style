@@ -1,20 +1,27 @@
-from typing import Optional
+from typing import Iterable, Optional, Sequence
 
 import torch
 
 
 def apply_repetition_penalty_(
     logits: torch.Tensor,
-    all_token_ids: torch.Tensor,
+    all_token_ids: torch.Tensor | Sequence[Iterable[int]],
     penalty: Optional[float],
 ) -> torch.Tensor:
     if penalty is None or penalty <= 1.0:
         return logits
 
-    for batch_idx in range(logits.size(0)):
-        used_ids = torch.unique(all_token_ids[batch_idx])
-        used_logits = logits[batch_idx, used_ids]
-        logits[batch_idx, used_ids] = torch.where(
+    if isinstance(all_token_ids, torch.Tensor):
+        token_rows = [torch.unique(all_token_ids[batch_idx]).tolist() for batch_idx in range(logits.size(0))]
+    else:
+        token_rows = [list(token_ids) for token_ids in all_token_ids]
+
+    for batch_idx, used_ids in enumerate(token_rows):
+        if not used_ids:
+            continue
+        used_ids_tensor = torch.tensor(used_ids, device=logits.device, dtype=torch.long)
+        used_logits = logits[batch_idx, used_ids_tensor]
+        logits[batch_idx, used_ids_tensor] = torch.where(
             used_logits < 0,
             used_logits * penalty,
             used_logits / penalty,

@@ -91,3 +91,20 @@ flowchart TD
 ```bash
 python -m unittest discover -s tests -q
 ```
+
+Real `LLMEngine` regression tests (uses actual model/runtime, opt-in):
+
+```bash
+RUN_REAL_ENGINE_TESTS=1 python -m unittest -q tests/test_llmengine_regression_real.py
+```
+
+Real `LLMEngine` load tests (opt-in and heavier):
+
+```bash
+RUN_REAL_ENGINE_TESTS=1 RUN_REAL_ENGINE_LOAD_TESTS=1 python -m unittest -q tests/test_llmengine_load_real.py
+```
+
+Load threshold overrides (optional):
+- `LOAD_MAX_ERROR_RATE`
+- `LOAD_MAX_P95_TOTAL_S`
+- `LOAD_MIN_THROUGHPUT_TPS`

@@ -250,13 +250,28 @@ class GroupedQueryAttention(nn.Module):
         k = k.reshape(B * self.group_size, self.num_kv_groups, S, self.head_dim) # [B*g,G,S,Hd]
         v = v.reshape(B * self.group_size, self.num_kv_groups, S, self.head_dim) # [B*g,G,S,Hd]
 
-        # ---- Build attention mask ----
-        # attn_mask: [1,1,T,S] broadcastable to SDPA
-        attn_mask = self._build_attn_mask(T, S, device=device, dtype=q.dtype)  # [1,1,T,S]
+        # Reuse SDPA causal fast path when the sequence shape allows it.
+        use_causal = False
+        attn_mask = None
+        if self.sliding_window is None:
+            if past_kv is None:
+                use_causal = True
+            elif T > 1:
+                attn_mask = self._build_attn_mask(T, S, device=device, dtype=q.dtype)
+        else:
+            attn_mask = self._build_attn_mask(T, S, device=device, dtype=q.dtype)
 
         # ---- SDPA ----
         # out: [B*g, G, T, Hd]
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0, scale=self.scale)
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            is_causal=use_causal,
+            scale=self.scale,
+        )
 
         # ---- Restore original head layout ----
         # out: [B*g,G,T,Hd] -> [B,g,G,T,Hd] -> [B,H,T,Hd] -> [B,T,H*Hd]
