@@ -37,11 +37,9 @@ class FakeChatService:
 class OpenAIChatAPITests(unittest.TestCase):
     def setUp(self):
         self.app = create_app(service_factory=FakeChatService)
-        self.client_cm = TestClient(self.app)
-        self.client = self.client_cm.__enter__()
-
-    def tearDown(self):
-        self.client_cm.__exit__(None, None, None)
+        self.client = TestClient(self.app)
+        self.client.__enter__()
+        self.addCleanup(self.client.__exit__, None, None, None)
 
     def test_non_stream_response_shape(self):
         response = self.client.post(
@@ -95,11 +93,9 @@ class OpenAIChatAPIStartupFailureTests(unittest.TestCase):
             raise RuntimeError("model init failed")
 
         self.app = create_app(service_factory=failing_service_factory)
-        self.client_cm = TestClient(self.app)
-        self.client = self.client_cm.__enter__()
-
-    def tearDown(self):
-        self.client_cm.__exit__(None, None, None)
+        self.client = TestClient(self.app)
+        self.client.__enter__()
+        self.addCleanup(self.client.__exit__, None, None, None)
 
     def test_readyz_reports_startup_failure(self):
         response = self.client.get("/readyz")

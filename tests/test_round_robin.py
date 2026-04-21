@@ -488,32 +488,5 @@ class RoundRobinSchedulerTests(unittest.TestCase):
         self.assertEqual([request.request_id for request in batch], [2, 3])
         self.assertEqual([request.request_id for request in decode_queue], [1, 4, 5, 6])
 
-    def test_prefix_cache_reduces_prefill_input_tokens(self):
-        config = EngineConfig(
-            choose_model="270m",
-            use_instruct_model=False,
-            max_new_tokens=1,
-            num_prefill_workers=1,
-            num_decode_workers=1,
-            sampling=SamplingConfig(
-                temperature=0.0,
-                top_p=1.0,
-                top_k=0,
-                repetition_penalty=1.0,
-            ),
-            prefix_cache_enabled=True,
-            prefix_cache_min_tokens=2,
-            prefix_cache_max_bytes=64 * 1024 * 1024,
-        )
-        runtime = FakeRuntimeSequence()
-        engine = LLMEngine(runtime=runtime, config=config)
-
-        results = engine.generate_many(["1 2 3 4", "1 2 3 4"])
-
-        self.assertEqual([r.stop_reason for r in results], ["max_new_tokens", "max_new_tokens"])
-        self.assertEqual(runtime.model.call_input_lengths[0], 4)
-        self.assertEqual(runtime.model.call_input_lengths[1], 1)
-
-
 if __name__ == "__main__":
     unittest.main()

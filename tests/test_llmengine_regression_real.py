@@ -49,7 +49,7 @@ class LLMEngineRealRegressionTests(unittest.TestCase):
     def test_batch_and_single_request_consistency(self):
         batch_results = self.engine_batch.generate_many(self.prompts, sampling=_sampling(), max_new_tokens=12)
         single_results = [
-            self.engine_batch.generate_many([prompt], sampling=_sampling(), max_new_tokens=12)[0]
+            self.engine_single.generate_many([prompt], sampling=_sampling(), max_new_tokens=12)[0]
             for prompt in self.prompts
         ]
 
