@@ -85,7 +85,7 @@ class ChatCompletionService:
                     "finish_reason": _finish_reason(result.stop_reason),
                 }
             ],
-            "usage": usage.dict(),
+            "usage": usage.model_dump(),
         }
 
     def stream_chat_completion(self, request: ChatCompletionRequest) -> Iterator[str]:
