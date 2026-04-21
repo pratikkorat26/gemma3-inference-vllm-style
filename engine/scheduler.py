@@ -5,7 +5,6 @@ from typing import Deque, Dict, Iterator, List, Optional
 import torch
 
 from .config import EngineConfig, SamplingConfig
-from .prefix_cache import PrefixCache
 from .runtime import GemmaRuntime, apply_chat_template
 from .sampling import apply_repetition_penalty_, sample_next_token
 from .types import GenerationResult, RequestState, StreamEvent
@@ -93,14 +92,6 @@ class LLMEngine:
             block_size=self.capacity.block_size,
             device=self.runtime.device,
         )
-        self.prefix_cache = (
-            PrefixCache(
-                min_tokens=self.config.prefix_cache_min_tokens,
-                max_bytes=self.config.prefix_cache_max_bytes,
-            )
-            if self.config.prefix_cache_enabled
-            else None
-        )
 
     def _encode_prompt(self, prompt: str) -> List[int]:
         if self.config.use_instruct_model:
@@ -149,7 +140,6 @@ class LLMEngine:
         request.all_token_ids = list(request.prompt_token_ids)
         request.seen_token_ids = set(request.prompt_token_ids)
         request.text_chunks = []
-        request.past_kv = None
         request.block_table = []
         request.prompt_cursor = 0
         request.num_computed_tokens = 0
@@ -161,7 +151,6 @@ class LLMEngine:
         request.decode_time_s = 0.0
         request.decode_steps = 0
         request.current_input = self._next_prefill_chunk(request)
-        self._apply_prefix_cache_hit(request)
 
     def _make_result(self, request: RequestState) -> GenerationResult:
         first_scheduled = request.first_scheduled_at_s if request.first_scheduled_at_s is not None else request.created_at_s
@@ -259,6 +248,12 @@ class LLMEngine:
         return eligible, blocked
 
     def _sample_next_tokens(self, logits: torch.Tensor, requests: List[RequestState]) -> torch.Tensor:
+        """Sample next tokens for a batch of requests.
+
+        Invariant: all requests in ``requests`` must share the same sampling
+        configuration. This is guaranteed by ``_select_decode_batch``, which
+        groups requests by their sampling key before forming a decode batch.
+        """
         with torch.inference_mode():
             next_logits = logits[:, -1, :].clone()
             next_logits = apply_repetition_penalty_(
@@ -336,7 +331,7 @@ class LLMEngine:
             request.prefill_time_s += elapsed
         else:
             request.decode_time_s += elapsed
-        request.decode_steps += 1
+            request.decode_steps += 1
 
         self._record_next_token(request, next_token, emit_text=emit_text)
 
@@ -370,45 +365,6 @@ class LLMEngine:
             request.sampling.top_k,
             request.sampling.repetition_penalty,
         )
-
-    def _apply_prefix_cache_hit(self, request: RequestState) -> None:
-        if self.prefix_cache is None:
-            return
-        if len(request.prompt_token_ids) <= 1:
-            return
-        if request.all_token_ids is None:
-            return
-
-        # Keep at least one prompt token in current_input to avoid zero-length forward.
-        max_prefix = len(request.prompt_token_ids) - 1
-        try:
-            hit = self.prefix_cache.lookup(
-                request.prompt_token_ids,
-                max_prefix_tokens=max_prefix,
-            )
-        except Exception:
-            return
-
-        if hit is None or hit.matched_tokens <= 0:
-            return
-
-        suffix = request.prompt_token_ids[hit.matched_tokens :]
-        if not suffix:
-            return
-
-        request.past_kv = hit.past_kv
-        request.current_input = torch.tensor(suffix, device=self.runtime.device).unsqueeze(0)
-
-    def _insert_prefix_cache(self, request: RequestState) -> None:
-        if self.prefix_cache is None:
-            return
-        if request.past_kv is None:
-            return
-        try:
-            self.prefix_cache.insert(request.prompt_token_ids, request.past_kv)
-        except Exception:
-            # Cache failures must not impact generation.
-            return
 
     def _select_decode_batch(self, decode_queue: Deque[RequestState]) -> List[RequestState]:
         max_batch = max(1, int(self.config.max_decode_batch_size))
@@ -444,6 +400,8 @@ class LLMEngine:
 
     def _run_decode_batch(self, batch: List[RequestState]) -> None:
         eligible, blocked = self._prepare_paged_batch(batch, defer_on_capacity=True)
+        # If every request in this batch is blocked by capacity, sacrifice the
+        # oldest one so its blocks are freed and the rest can proceed later.
         if not eligible and blocked:
             self._finish_request(
                 blocked[0],
@@ -510,6 +468,13 @@ class LLMEngine:
             ordered_ids.append(request_id)
             prefill_queue.append(request)
 
+        # Scheduling policy:
+        # 1. Interleave prefill with decode: prefill one request while the
+        #    decode queue is not already at max_decode_batch_size.
+        # 2. If a request cannot be admitted (KV capacity), defer it and
+        #    try running decode steps to free blocks.
+        # 3. Decode uses round-robin cohort selection: group requests by
+        #    (sequence_length, sampling_config) and pick the largest group.
         while prefill_queue or decode_queue:
             if prefill_queue and len(decode_queue) < max(1, int(self.config.max_decode_batch_size)):
                 request = prefill_queue.popleft()
@@ -538,7 +503,6 @@ class LLMEngine:
                         if request.status not in ("finished", "error") and final_prefill_logits is not None:
                             next_token = self._sample_next_tokens(final_prefill_logits, [request])
                             self._record_next_token(request, next_token, emit_text=False)
-                        self._insert_prefix_cache(request)
                 except Exception as exc:
                     self._finish_request(request, reason="error", error_message=str(exc))
 
@@ -615,7 +579,6 @@ class LLMEngine:
                 self._record_next_token(request, next_token, emit_text=True)
                 if request.text_chunks:
                     yield StreamEvent(kind="text", text=request.text_chunks[-1])
-            self._insert_prefix_cache(request)
 
             while request.status not in ("finished", "error"):
                 previous_chunks = len(request.text_chunks)

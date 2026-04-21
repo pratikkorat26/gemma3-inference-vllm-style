@@ -1,12 +1,9 @@
 from dataclasses import dataclass, field
-from typing import List, Optional, Set, Tuple
+from typing import List, Optional, Set
 
 import torch
 
 from .config import SamplingConfig
-
-
-LayerCache = Optional[List[Optional[Tuple[torch.Tensor, torch.Tensor]]]]
 
 
 @dataclass
@@ -19,7 +16,6 @@ class RequestState:
     generated_ids: List[int] = field(default_factory=list)
     all_token_ids: List[int] = field(default_factory=list)
     seen_token_ids: Set[int] = field(default_factory=set)
-    past_kv: LayerCache = None
     current_input: Optional[torch.Tensor] = None
     text_chunks: List[str] = field(default_factory=list)
     block_table: List[int] = field(default_factory=list)
@@ -56,14 +52,6 @@ class RequestState:
             eos_token_id=eos_token_id,
             created_at_s=created_at_s,
         )
-
-    def should_stop(self) -> bool:
-        if len(self.generated_ids) >= self.max_new_tokens:
-            return True
-        if self.eos_token_id is None:
-            return False
-        return bool(self.generated_ids and self.generated_ids[-1] == self.eos_token_id)
-
 
 @dataclass
 class GenerationResult:

@@ -16,6 +16,8 @@ class EngineConfig:
     use_instruct_model: bool = True
     max_new_tokens: int = 180
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
+    # Multi-worker support is reserved for future multi-device backends.
+    # The current single-device scheduler requires both to be 1.
     num_prefill_workers: int = 1
     num_decode_workers: int = 1
     max_decode_batch_size: int = 4
@@ -24,6 +26,3 @@ class EngineConfig:
     kv_block_size: int = 16
     num_kv_blocks: Optional[int] = None
     prefill_chunk_size: Optional[int] = None
-    prefix_cache_enabled: bool = False
-    prefix_cache_min_tokens: int = 16
-    prefix_cache_max_bytes: int = 512 * 1024 * 1024
