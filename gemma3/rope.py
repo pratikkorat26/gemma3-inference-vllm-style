@@ -44,24 +44,6 @@ def apply_rope_single(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> 
     return (x * cos) + (rotate_half(x) * sin)
 
 
-def apply_rotary_pos_emb(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Apply RoPE to query and key tensors.
-
-    Args:
-      q:   [B, H, T, D]
-      k:   [B, H or G, T, D]
-      cos: [T, D]
-      sin: [T, D]
-    """
-    return apply_rope_single(q, cos, sin), apply_rope_single(k, cos, sin)
-
-
 class RotaryEmbedding(nn.Module):
     """
     Production-ready RoPE cache.
