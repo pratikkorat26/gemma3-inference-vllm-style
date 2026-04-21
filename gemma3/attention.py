@@ -392,6 +392,8 @@ class GroupedQueryAttention(nn.Module):
         v = v.reshape(B * self.group_size, self.num_kv_groups, S, self.head_dim) # [B*g,G,S,Hd]
 
         # Reuse SDPA causal fast path when the sequence shape allows it.
+        # When T==1 during decoding, the single query is always at the last
+        # position, so causal masking is implicit and no mask is needed.
         use_causal = False
         attn_mask = None
         if self.sliding_window is None:
