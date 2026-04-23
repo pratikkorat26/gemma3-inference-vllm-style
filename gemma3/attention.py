@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
+from typing import Optional, Tuple
 from gemma3.rope import apply_rope_single
 from gemma3.paged_kv import PagedKVCache
 
@@ -236,6 +236,9 @@ class GroupedQueryAttention(nn.Module):
             q = torch.cat(q_rope, dim=0)
             k = torch.cat(k_rope, dim=0)
 
+        # NOTE: paged KV writes are required for correctness (tokens must be
+        # in the cache to attend to themselves), so they happen regardless of
+        # use_cache. use_cache only controls whether next_kv is returned.
         self._append_to_paged_cache(
             k_new=k,
             v_new=v,
@@ -244,14 +247,29 @@ class GroupedQueryAttention(nn.Module):
             paged_kv_cache=paged_kv_cache,
         )
 
+        # NOTE: This loop processes batch items individually. It is readable
+        # and correct, but not GPU-optimal. A production implementation would
+        # fuse these operations across the batch dimension.
         outputs = []
         for batch_idx in range(batch_size):
-            seq_len = int(kv_lens[batch_idx].item()) + q_len
-            k_seq, v_seq = self._gather_sequence_kv(
-                block_table=block_tables[batch_idx],
-                seq_len=seq_len,
-                paged_kv_cache=paged_kv_cache,
-            )
+            past_len = int(kv_lens[batch_idx].item())
+            seq_len = past_len + q_len
+
+            if past_len > 0:
+                # Chunked prefill / decode with prior context: gather only the
+                # past tokens from paged blocks and concat with freshly computed KV.
+                k_past, v_past = self._gather_sequence_kv(
+                    block_table=block_tables[batch_idx],
+                    seq_len=past_len,
+                    paged_kv_cache=paged_kv_cache,
+                )
+                k_seq = torch.cat([k_past, k[batch_idx]], dim=1)
+                v_seq = torch.cat([v_past, v[batch_idx]], dim=1)
+            else:
+                # Pure prefill with no prior context: freshly computed KV is
+                # already contiguous and correct. Skip the redundant gather.
+                k_seq = k[batch_idx]
+                v_seq = v[batch_idx]
 
             q_batch = q[batch_idx : batch_idx + 1]
             k_batch = k_seq.unsqueeze(0)
@@ -265,13 +283,22 @@ class GroupedQueryAttention(nn.Module):
             k_batch = k_batch.reshape(self.group_size, self.num_kv_groups, seq_len, self.head_dim)
             v_batch = v_batch.reshape(self.group_size, self.num_kv_groups, seq_len, self.head_dim)
 
-            attn_mask = self._build_attn_mask(q_len, seq_len, device=device, dtype=q_batch.dtype)
+            if past_len == 0 and self.sliding_window is None:
+                # No prior context and no sliding window: use SDPA's highly
+                # optimized causal fast path instead of a custom mask.
+                attn_mask = None
+                use_causal = True
+            else:
+                attn_mask = self._build_attn_mask(q_len, seq_len, device=device, dtype=q_batch.dtype)
+                use_causal = False
+
             out_batch = F.scaled_dot_product_attention(
                 q_batch,
                 k_batch,
                 v_batch,
                 attn_mask=attn_mask,
                 dropout_p=0.0,
+                is_causal=use_causal,
                 scale=self.scale,
             )
             out_batch = out_batch.reshape(1, self.group_size, self.num_kv_groups, q_len, self.head_dim)
@@ -285,12 +312,12 @@ class GroupedQueryAttention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        past_kv: Optional[tuple] = None,
+        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
         block_tables: Optional[torch.Tensor] = None,
         kv_lens: Optional[torch.Tensor] = None,
         paged_kv_cache: Optional[PagedKVCache] = None,
-    ):
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         """
         Inputs:
           x:        [B, T, D]
@@ -319,6 +346,15 @@ class GroupedQueryAttention(nn.Module):
 
         if past_kv is not None:
             self._validate_past_kv(past_kv, batch_size=B)
+            # Non-paged KV path assumes every sequence in the batch has the
+            # same past length because past_kv is a single dense tensor.
+            # Batched decoding with variable-length sequences requires the
+            # paged KV path instead.
+            if B > 1:
+                raise NotImplementedError(
+                    "Batched non-paged KV attention (batch_size > 1 with past_kv) "
+                    "is not supported. Use paged_kv_cache for batched inference."
+                )
 
         # ---- Projections ----
         # q_lin: [B,T,H*Hd]

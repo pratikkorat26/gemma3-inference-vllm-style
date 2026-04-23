@@ -82,7 +82,8 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("sin_cached", torch.empty(0, dtype=self.cache_dtype), persistent=False)
         self.max_seq_len_cached: int = 0
 
-        self._build_cache(max_position_embeddings, device=self.inv_freq.device)
+        # Cache is built lazily on first get_cos_sin() call to avoid allocating
+        # on CPU when the module will be moved to GPU immediately after init.
 
     @torch.no_grad()
     def _build_cache(self, seq_len: int, device: Optional[torch.device] = None) -> None:

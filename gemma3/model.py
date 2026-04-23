@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 from gemma3.attention import RMSNorm, GroupedQueryAttention
 from gemma3.feedforward import FeedForward
@@ -203,7 +203,7 @@ class Gemma3Model(nn.Module):
         block_tables: Optional[torch.Tensor] = None,
         kv_lens: Optional[torch.Tensor] = None,
         paged_kv_caches: Optional[List[PagedKVCache]] = None,
-    ):
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[Optional[Tuple[torch.Tensor, torch.Tensor]]]]]:
         if input_ids.ndim != 2:
             raise ValueError("input_ids must be [B, T]")
         if input_ids.shape[1] > self.context_length:
