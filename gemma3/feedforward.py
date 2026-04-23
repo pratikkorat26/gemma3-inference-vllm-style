@@ -24,4 +24,4 @@ class FeedForward(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, T, emb_dim]
-        return self.down(F.gelu(self.gate(x), approximate="tanh") * self.up(x))
+        return self.down(F.gelu(self.gate(x)) * self.up(x))
