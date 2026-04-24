@@ -7,7 +7,7 @@ import torch
 from .config import EngineConfig, SamplingConfig
 from .runtime import GemmaRuntime, apply_chat_template
 from .sampling import apply_repetition_penalty_, sample_next_token
-from .types import GenerationResult, RequestState, StreamEvent
+from .types import GenerationResult, RequestState, StopReason, StreamEvent
 
 
 class KVBlockManager:
@@ -125,31 +125,17 @@ class LLMEngine:
     def _release_request_capacity(self, request: RequestState) -> None:
         self.capacity.release(request)
 
-    def _finish_request(self, request: RequestState, reason: str, error_message: Optional[str] = None) -> None:
-        request.status = "finished" if reason != "error" else "error"
-        request.phase = request.status
-        request.stop_reason = reason
-        request.error_message = error_message
-        request.finished_at_s = time.perf_counter()
+    def _finish_request(
+        self,
+        request: RequestState,
+        reason: StopReason,
+        error_message: Optional[str] = None,
+    ) -> None:
+        request.finish(reason, error_message=error_message, finished_at_s=time.perf_counter())
         self._release_request_capacity(request)
 
     def _init_request(self, request: RequestState) -> None:
-        request.status = "active"
-        request.phase = "prefill"
-        request.generated_ids = []
-        request.all_token_ids = list(request.prompt_token_ids)
-        request.seen_token_ids = set(request.prompt_token_ids)
-        request.text_chunks = []
-        request.block_table = []
-        request.prompt_cursor = 0
-        request.live_kv_tokens = 0
-        request.stop_reason = None
-        request.error_message = None
-        request.prefill_time_s = 0.0
-        request.prefill_steps = 0
-        request.decode_time_s = 0.0
-        request.decode_steps = 0
-        request.current_input = self._next_prefill_chunk(request)
+        request.reset_for_generation(current_input=self._next_prefill_chunk(request))
 
     def _make_result(self, request: RequestState) -> GenerationResult:
         first_scheduled = request.first_scheduled_at_s if request.first_scheduled_at_s is not None else request.created_at_s
@@ -160,7 +146,7 @@ class LLMEngine:
         model_tokens_per_s = 0.0 if model_time_s <= 0 else len(request.generated_ids) / model_time_s
         text_ids = list(request.generated_ids)
         if (
-            request.stop_reason == "eos"
+            request.stop_reason == StopReason.EOS
             and request.eos_token_id is not None
             and text_ids
             and text_ids[-1] == request.eos_token_id
@@ -171,7 +157,7 @@ class LLMEngine:
             request_id=request.request_id,
             text=self.runtime.tokenizer.decode(text_ids) if text_ids else "",
             token_ids=list(request.generated_ids),
-            stop_reason=request.stop_reason or "error",
+            stop_reason=(request.stop_reason or StopReason.ERROR).value,
             error_message=request.error_message,
             queue_wait_s=queue_wait_s,
             prefill_s=request.prefill_time_s,
@@ -227,10 +213,14 @@ class LLMEngine:
         blocked: List[RequestState] = []
         for request in requests:
             if request.current_input is None:
-                self._finish_request(request, reason="error", error_message="request tensors are not initialized")
+                self._finish_request(
+                    request,
+                    reason=StopReason.ERROR,
+                    error_message="request tensors are not initialized",
+                )
                 continue
             if len(request.all_token_ids) >= self._context_limit():
-                self._finish_request(request, reason="context_limit")
+                self._finish_request(request, reason=StopReason.CONTEXT_LIMIT)
                 continue
             target_tokens = request.live_kv_tokens + int(request.current_input.shape[1])
             if not self.capacity.ensure_capacity(request, target_tokens):
@@ -239,7 +229,7 @@ class LLMEngine:
                 else:
                     self._finish_request(
                         request,
-                        reason="capacity_exceeded",
+                        reason=StopReason.CAPACITY_EXCEEDED,
                         error_message="KV cache capacity exceeded",
                     )
                 continue
@@ -297,7 +287,7 @@ class LLMEngine:
         request.generated_ids.append(next_id)
 
         if request.eos_token_id is not None and next_id == request.eos_token_id:
-            self._finish_request(request, reason="eos")
+            self._finish_request(request, reason=StopReason.EOS)
             return
 
         request.all_token_ids.append(next_id)
@@ -307,19 +297,19 @@ class LLMEngine:
             request.text_chunks.append(self.runtime.tokenizer.decode([next_id]))
 
         if len(request.generated_ids) >= request.max_new_tokens:
-            self._finish_request(request, reason="max_new_tokens")
+            self._finish_request(request, reason=StopReason.MAX_NEW_TOKENS)
             return
 
-        request.phase = "decode"
+        request.move_to_decode()
 
     def _run_one_step(self, request: RequestState, phase: str, *, emit_text: bool = False) -> None:
         if len(request.all_token_ids) >= self._context_limit():
-            self._finish_request(request, reason="context_limit")
+            self._finish_request(request, reason=StopReason.CONTEXT_LIMIT)
             return
 
         started = time.perf_counter()
         logits = self._forward_paged_batch([request])
-        if request.status in ("finished", "error"):
+        if request.is_done():
             return
 
         next_token = self._sample_next_tokens(logits, [request])
@@ -341,7 +331,7 @@ class LLMEngine:
 
         started = time.perf_counter()
         logits = self._forward_paged_batch([request])
-        if request.status in ("finished", "error"):
+        if request.is_done():
             return None
 
         elapsed = time.perf_counter() - started
@@ -353,7 +343,7 @@ class LLMEngine:
             return logits
 
         request.current_input = self._next_prefill_chunk(request)
-        request.phase = "prefill"
+        request.move_to_prefill()
         return None
 
     def _sampling_key(self, request: RequestState):
@@ -403,7 +393,7 @@ class LLMEngine:
         if not eligible and blocked:
             self._finish_request(
                 blocked[0],
-                reason="capacity_exceeded",
+                reason=StopReason.CAPACITY_EXCEEDED,
                 error_message="KV cache capacity exceeded",
             )
             return
@@ -477,33 +467,33 @@ class LLMEngine:
                 request = prefill_queue.popleft()
                 try:
                     if request.max_new_tokens <= 0:
-                        self._finish_request(request, reason="max_new_tokens")
+                        self._finish_request(request, reason=StopReason.MAX_NEW_TOKENS)
                     elif len(request.prompt_token_ids) >= self._context_limit():
-                        self._finish_request(request, reason="context_limit")
+                        self._finish_request(request, reason=StopReason.CONTEXT_LIMIT)
                     else:
                         if request.first_scheduled_at_s is None:
                             if not self.capacity.can_allocate_for(request, len(request.prompt_token_ids)):
-                                prefill_queue.append(request)
                                 if decode_queue:
+                                    prefill_queue.append(request)
                                     continue
                                 self._finish_request(
                                     request,
-                                    reason="capacity_exceeded",
+                                    reason=StopReason.CAPACITY_EXCEEDED,
                                     error_message="KV cache capacity exceeded",
                                 )
                                 results[request.request_id] = self._make_result(request)
                                 continue
                             request.first_scheduled_at_s = time.perf_counter()
                             self._init_request(request)
-                        request.phase = "prefill"
+                        request.move_to_prefill()
                         final_prefill_logits = self._run_prefill_chunk(request)
-                        if request.status not in ("finished", "error") and final_prefill_logits is not None:
+                        if not request.is_done() and final_prefill_logits is not None:
                             next_token = self._sample_next_tokens(final_prefill_logits, [request])
                             self._record_next_token(request, next_token, emit_text=False)
                 except Exception as exc:
-                    self._finish_request(request, reason="error", error_message=str(exc))
+                    self._finish_request(request, reason=StopReason.ERROR, error_message=str(exc))
 
-                if request.status in ("finished", "error"):
+                if request.is_done():
                     results[request.request_id] = self._make_result(request)
                 elif not self._prefill_complete(request):
                     prefill_queue.append(request)
@@ -517,12 +507,12 @@ class LLMEngine:
                     self._run_decode_batch(batch)
                 except Exception as exc:
                     for request in batch:
-                        if request.status in ("finished", "error"):
+                        if request.is_done():
                             continue
-                        self._finish_request(request, reason="error", error_message=str(exc))
+                        self._finish_request(request, reason=StopReason.ERROR, error_message=str(exc))
 
                 for request in batch:
-                    if request.status in ("finished", "error"):
+                    if request.is_done():
                         results[request.request_id] = self._make_result(request)
                     else:
                         decode_queue.append(request)
@@ -546,48 +536,48 @@ class LLMEngine:
         request.first_scheduled_at_s = time.perf_counter()
 
         if request.max_new_tokens <= 0:
-            self._finish_request(request, reason="max_new_tokens")
-            yield StreamEvent(kind="done", stop_reason=request.stop_reason)
+            self._finish_request(request, reason=StopReason.MAX_NEW_TOKENS)
+            yield StreamEvent(kind="done", stop_reason=request.stop_reason.value)
             return
 
         if len(request.prompt_token_ids) >= self._context_limit():
-            self._finish_request(request, reason="context_limit")
-            yield StreamEvent(kind="done", stop_reason=request.stop_reason)
+            self._finish_request(request, reason=StopReason.CONTEXT_LIMIT)
+            yield StreamEvent(kind="done", stop_reason=request.stop_reason.value)
             return
 
         if not self.capacity.can_allocate_for(request, len(request.prompt_token_ids)):
             self._finish_request(
                 request,
-                reason="capacity_exceeded",
+                reason=StopReason.CAPACITY_EXCEEDED,
                 error_message="KV cache capacity exceeded",
             )
-            yield StreamEvent(kind="done", stop_reason=request.stop_reason)
+            yield StreamEvent(kind="done", stop_reason=request.stop_reason.value)
             return
 
         self._init_request(request)
 
         try:
             final_prefill_logits = None
-            while request.status not in ("finished", "error") and not self._prefill_complete(request):
+            while not request.is_done() and not self._prefill_complete(request):
                 final_prefill_logits = self._run_prefill_chunk(request)
 
-            if request.status not in ("finished", "error") and final_prefill_logits is not None:
+            if not request.is_done() and final_prefill_logits is not None:
                 next_token = self._sample_next_tokens(final_prefill_logits, [request])
                 self._record_next_token(request, next_token, emit_text=True)
                 if request.text_chunks:
                     yield StreamEvent(kind="text", text=request.text_chunks[-1])
 
-            while request.status not in ("finished", "error"):
+            while not request.is_done():
                 previous_chunks = len(request.text_chunks)
                 self._run_one_step(request, phase="decode", emit_text=True)
                 if len(request.text_chunks) > previous_chunks:
                     yield StreamEvent(kind="text", text=request.text_chunks[-1])
         except Exception as exc:
-            self._finish_request(request, reason="error", error_message=str(exc))
+            self._finish_request(request, reason=StopReason.ERROR, error_message=str(exc))
 
         yield StreamEvent(
             kind="done",
-            stop_reason=request.stop_reason,
+            stop_reason=(request.stop_reason or StopReason.ERROR).value,
             error_message=request.error_message,
         )
 

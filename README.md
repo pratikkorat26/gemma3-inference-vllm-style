@@ -77,7 +77,22 @@ This keeps the engine readable while matching the basic vLLM-style idea: admit r
 
 - `GET /healthz`: lightweight liveness probe
 - `GET /readyz`: readiness probe; returns `200` only after `ChatCompletionService` has loaded successfully
+- `GET /metrics`: lightweight runtime counters for active/queued requests, request outcomes, and KV block usage
 - `POST /v1/chat/completions`: returns `503` if service startup failed or is not yet complete
+
+The API keeps a bounded admission queue in front of the single engine instance. If the queue is full, requests fail fast with `429` instead of waiting indefinitely. Streaming responses release their admission slot when the stream completes, errors, or is closed by the client.
+
+## Supported Reliability Scope
+
+This project intentionally stays smaller than vLLM:
+
+- single process, single engine instance, single device
+- bounded API admission instead of a distributed request router
+- paged KV allocation with immediate block release on finish
+- chunked prefill and decode batching, but no preemption scheduler
+- no tensor parallelism, speculative decoding, prefix caching, or multi-node serving
+
+The goal is to make correctness and failure modes easy to inspect before adding throughput-oriented features.
 
 The API now initializes `ChatCompletionService` during app startup, so model load and download failures surface at boot instead of on the first request.
 

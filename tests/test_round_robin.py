@@ -12,7 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from engine.config import EngineConfig, SamplingConfig
 from engine.scheduler import LLMEngine
-from engine.types import RequestState
+from engine.types import RequestPhase, RequestState, RequestStatus, StopReason
 from gemma3.paged_kv import PagedKVCache
 
 
@@ -286,6 +286,33 @@ class RoundRobinSchedulerTests(unittest.TestCase):
         self.assertIn("KV cache capacity exceeded", result.error_message or "")
         self.assertEqual(result.token_ids, [11])
 
+    def test_prompt_too_large_for_empty_cache_is_rejected_once(self):
+        runtime = FakeRuntimeSequence()
+        config = EngineConfig(
+            choose_model="270m",
+            use_instruct_model=False,
+            max_new_tokens=2,
+            max_kv_cache_tokens=1,
+            kv_block_size=1,
+            num_kv_blocks=1,
+            num_prefill_workers=1,
+            num_decode_workers=1,
+            sampling=SamplingConfig(
+                temperature=0.0,
+                top_p=1.0,
+                top_k=0,
+                repetition_penalty=1.0,
+            ),
+        )
+        engine = LLMEngine(runtime=runtime, config=config)
+
+        result = engine.generate_many(["1 2"], max_new_tokens=2)[0]
+
+        self.assertEqual(result.stop_reason, "capacity_exceeded")
+        self.assertIn("KV cache capacity exceeded", result.error_message or "")
+        self.assertEqual(result.token_ids, [])
+        self.assertEqual(runtime.model.call_last_tokens, [])
+
     def test_capacity_released_after_finished_request(self):
         runtime = FakeRuntime()
         config = EngineConfig(
@@ -487,6 +514,70 @@ class RoundRobinSchedulerTests(unittest.TestCase):
 
         self.assertEqual([request.request_id for request in batch], [2, 3])
         self.assertEqual([request.request_id for request in decode_queue], [1, 4, 5, 6])
+
+
+class ConfigValidationTests(unittest.TestCase):
+    def test_sampling_rejects_invalid_values(self):
+        with self.assertRaises(ValueError):
+            SamplingConfig(temperature=float("nan"))
+        with self.assertRaises(ValueError):
+            SamplingConfig(top_p=0.0)
+        with self.assertRaises(ValueError):
+            SamplingConfig(top_k=-1)
+        with self.assertRaises(ValueError):
+            SamplingConfig(repetition_penalty=0.0)
+
+    def test_engine_config_rejects_invalid_values(self):
+        with self.assertRaises(ValueError):
+            EngineConfig(max_new_tokens=-1)
+        with self.assertRaises(ValueError):
+            EngineConfig(max_decode_batch_size=0)
+        with self.assertRaises(ValueError):
+            EngineConfig(decode_selection_window=0)
+        with self.assertRaises(ValueError):
+            EngineConfig(max_kv_cache_tokens=0)
+        with self.assertRaises(ValueError):
+            EngineConfig(kv_block_size=0)
+        with self.assertRaises(ValueError):
+            EngineConfig(max_kv_cache_tokens=8, kv_block_size=4, num_kv_blocks=3)
+        with self.assertRaises(ValueError):
+            EngineConfig(prefill_chunk_size=0)
+
+
+class RequestStateTransitionTests(unittest.TestCase):
+    def _request(self) -> RequestState:
+        return RequestState.from_prompt(
+            request_id=0,
+            prompt_token_ids=[1],
+            sampling=SamplingConfig(temperature=0.0, top_p=1.0, top_k=0, repetition_penalty=1.0),
+            max_new_tokens=1,
+            eos_token_id=FakeTokenizer.eos_token_id,
+            created_at_s=0.0,
+        )
+
+    def test_valid_generation_lifecycle(self):
+        request = self._request()
+
+        request.reset_for_generation(current_input=None)
+        self.assertEqual(request.status, RequestStatus.ACTIVE)
+        self.assertEqual(request.phase, RequestPhase.PREFILL)
+
+        request.move_to_decode()
+        self.assertEqual(request.phase, RequestPhase.DECODE)
+
+        request.finish(StopReason.MAX_NEW_TOKENS, finished_at_s=1.0)
+        self.assertTrue(request.is_done())
+        self.assertEqual(request.phase, RequestPhase.FINISHED)
+
+    def test_rejects_invalid_transition_after_finish(self):
+        request = self._request()
+        request.finish(StopReason.CONTEXT_LIMIT, finished_at_s=1.0)
+
+        with self.assertRaises(RuntimeError):
+            request.move_to_decode()
+        with self.assertRaises(RuntimeError):
+            request.finish(StopReason.ERROR, finished_at_s=2.0)
+
 
 if __name__ == "__main__":
     unittest.main()

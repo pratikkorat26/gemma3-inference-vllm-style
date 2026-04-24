@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import json
 from typing import Callable
 
 from fastapi import FastAPI, HTTPException, Request
@@ -6,7 +7,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from .schemas import ChatCompletionRequest
-from .service import ChatCompletionService
+from .service import ChatCompletionService, ServiceOverloadedError
 
 ServiceFactory = Callable[[], ChatCompletionService]
 
@@ -55,9 +56,17 @@ def create_app(service_factory: ServiceFactory = ChatCompletionService) -> FastA
             raise HTTPException(status_code=503, detail=_service_unavailable_message(fastapi_app))
         return {"status": "ready"}
 
+    @fastapi_app.get("/metrics")
+    async def metrics(request: Request) -> dict:
+        service = get_service(request.app)
+        if hasattr(service, "metrics_snapshot"):
+            return service.metrics_snapshot()
+        return {"status": "metrics_unavailable"}
+
     @fastapi_app.post("/v1/chat/completions")
     async def chat_completions(payload: ChatCompletionRequest, request: Request):
         service = get_service(request.app)
+        trace_id = request.headers.get("X-Trace-Id")
         try:
             if payload.stream:
                 return StreamingResponse(
@@ -65,8 +74,16 @@ def create_app(service_factory: ServiceFactory = ChatCompletionService) -> FastA
                     media_type="text/event-stream",
                     headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
                 )
+            if trace_id and hasattr(service, "create_chat_completion_traced"):
+                response, trace_data = await run_in_threadpool(service.create_chat_completion_traced, payload, trace_id)
+                return JSONResponse(
+                    response,
+                    headers={"X-Trace-Data": json.dumps(trace_data, separators=(",", ":"))},
+                )
             response = await run_in_threadpool(service.create_chat_completion, payload)
             return JSONResponse(response)
+        except ServiceOverloadedError as exc:
+            raise HTTPException(status_code=429, detail=str(exc))
         except RuntimeError as exc:
             raise HTTPException(status_code=500, detail=str(exc))
 
